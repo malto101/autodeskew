@@ -2,7 +2,40 @@ from types import coroutine
 import cv2
 import numpy as np
 
+
+def fill_notches(mask):
+    """
+    Detects and fills notches (U-shaped gaps) in the green mask.
+    Args:
+        mask (numpy.ndarray): Binary mask of the green screen.
+    Returns:
+        filled_mask (numpy.ndarray): Binary mask with notches filled.
+    """
+
+    # Find contours of the mask
+    contours, _ = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Create an empty mask to draw filled contours
+    filled_mask = np.zeros_like(mask)
+
+    for contour in contours:
+        # Approximate the contour to simplify it
+        epsilon = 0.002 * cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+
+        # Create a convex hull to cover notches (fills U-shaped gaps)
+        hull = cv2.convexHull(approx)
+
+        # Draw the filled hull on the mask
+        cv2.drawContours(filled_mask, [hull], -1, 255, thickness=cv2.FILLED)
+
+    filled_mask = cv2.bitwise_or(filled_mask, mask)
+
+    return filled_mask
+
 def highlight_green_as_blue(image):
+
     """
     Highlights all green regions in the image by changing them to blue.
     Args:
@@ -19,13 +52,14 @@ def highlight_green_as_blue(image):
     
     # Create a mask for the green color
     mask = cv2.inRange(hsv, lower_green, upper_green)
-
-
+    
     # Apply morphological operations to clean the mask (removes small noise)
     kernel = np.ones((5, 5), np.uint8)  # You can adjust the size of the kernel
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     
+    # Fill notches in the mask
+    mask = fill_notches(mask)
     # Convert the mask to blue
     image[mask != 0] = [255, 0, 0]  # Change green areas to blue (BGR: [255, 0, 0])
     
@@ -109,50 +143,74 @@ def draw_lines(image, edges):
     return line_image, line_segments
 
 
-def fit_rectangle_to_lines(image, line_segments):
+def find_line_intersection(line1, line2):
     """
-    Fits a rectangle to the four longest lines in the image.
+    Finds the intersection point of two lines (extended indefinitely).
+    Args:
+        line1, line2: Tuples ((x1, y1), (x2, y2)) representing two lines.
+    Returns:
+        (x, y): Intersection point as a tuple, or None if lines are parallel.
+    """
+    x1, y1, x2, y2 = line1[0][0], line1[0][1], line1[1][0], line1[1][1]
+    x3, y3, x4, y4 = line2[0][0], line2[0][1], line2[1][0], line2[1][1]
+
+    # Calculate the determinant
+    det = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if det == 0:  # Lines are parallel or coincident
+        return None
+
+    # Calculate the intersection point
+    px = ((x1 * y2 - y1 * x2) * (x3 - x4) -
+          (x1 - x2) * (x3 * y4 - y3 * x4)) / det
+    py = ((x1 * y2 - y1 * x2) * (y3 - y4) -
+          (y1 - y2) * (x3 * y4 - y3 * x4)) / det
+
+    return int(px), int(py)
+
+
+def fit_intersections_to_lines(image, line_segments):
+    """
+    Finds and marks the intersection points of the four longest lines.
     Args:
         image (numpy.ndarray): The original image.
         line_segments (list): List of line segments [(pt1, pt2, length), ...].
     Returns:
-        image_with_rectangle (numpy.ndarray): The image with the fitted rectangle drawn.
-        corners (numpy.ndarray): The corner points of the fitted rectangle as an array of shape (4, 2).
+        image_with_points (numpy.ndarray): The image with intersection points drawn.
+        intersections (list): The intersection points of the lines.
     """
     # Ensure we have at least 4 lines
     if len(line_segments) < 4:
-        print("Error: Not enough line segments to fit a rectangle.")
-        return image
+        print("Error: Not enough line segments to calculate intersections.")
+        return image, []
 
     # Get the top 4 longest lines
     longest_lines = line_segments[:4]
 
-    # Collect all the endpoints of the 4 longest lines
-    points = []
-    for pt1, pt2, _ in longest_lines:
-        points.extend([pt1, pt2])
+    # Find all pairwise intersections of these lines
+    intersections = []
+    for i in range(len(longest_lines)):
+        for j in range(i + 1, len(longest_lines)):
+            pt1, pt2, _ = longest_lines[i]
+            pt3, pt4, _ = longest_lines[j]
+            intersection = find_line_intersection((pt1, pt2), (pt3, pt4))
+            if intersection:
+                intersections.append(intersection)
 
-    # Convert to NumPy array for OpenCV functions
-    points = np.array(points, dtype=np.float32)
+    # Draw the intersections on a copy of the image
+    image_with_points = image.copy()
+    for point in intersections:
+        cv2.circle(image_with_points, point, radius=5,
+                   color=(0, 0, 255), thickness=-1)
 
-    # Fit a minimum-area bounding rectangle to the points
-    # rect contains (center, (width, height), angle)
-    rect = cv2.minAreaRect(points)
-    box = cv2.boxPoints(rect)       # Get the 4 corner points of the rectangle
-    box = np.int64(box)              # Convert to integer coordinates
-    corners = np.int64(box)          # Convert to integer coordinates
+    # Connect all the points with line
+    for i in range(len(intersections)):
+        for j in range(i + 1, len(intersections)):
+            cv2.line(image_with_points, intersections[i],
+                     intersections[j], (0, 0, 255), 2)
 
-  # Reshape box to match the expected format for cv2.drawContours
-    contours = box.reshape((-1, 1, 2))  # Shape it into (n, 1, 2)
+    return image_with_points, intersections
 
-    # Draw the rectangle on a copy of the image
-    image_with_rectangle = image.copy()
-    cv2.drawContours(image_with_rectangle, [contours], -1, (0, 0, 255), 3)  # Draw red rectangle
-
-    return image_with_rectangle, corners
-
-
-def main(image_path, output_path_with_corners, output_path_with_edges, output_path_with_lines, output_path_with_rectangle):
+def main(image_path):
     """
     Main function to load the image, highlight green regions as blue, detect edges, and save the results.
     Args:
@@ -173,35 +231,23 @@ def main(image_path, output_path_with_corners, output_path_with_edges, output_pa
 
     # Detect edges in the blue areas
     edges = detect_edges(result_image)
-
     # Draw lines from the detected edges
     line_image, line_segments = draw_lines(result_image, edges)
 
     # Save the intermediate outputs
-    cv2.imwrite(output_path_with_corners, result_image)
-    cv2.imwrite(output_path_with_edges, edges)
-    cv2.imwrite(output_path_with_lines, line_image)
+    cv2.imshow("output_path_with_corners", result_image)
+    cv2.imshow("output_path_with_edges", edges)
+    cv2.imshow("output_path_with_lines", line_image)
 
     # Fit a rectangle to the 4 longest lines and save the result
-    image_with_rectangle, main_corners = fit_rectangle_to_lines(result_image, line_segments)
-
-    cv2.imwrite(output_path_with_rectangle, image_with_rectangle)
-    
-    print(f"Output image with rectangle saved to: {
-          output_path_with_rectangle}")
-    print(f"Corner points of the fitted rectangle:\n {main_corners}")
+    image_with_points, intersections = fit_intersections_to_lines(
+        line_image, line_segments)
+    cv2.imshow("output_path_with_rectangle", image_with_points)
+    cv2.waitKey(0)
+    print(f"Corner points of the rectangle: {intersections}")
 
 if __name__ == "__main__":
-    input_image_path = "image.jpeg"
-    output_image_path_with_corners = "output_image_with_corners.jpg"
-    output_image_path_with_edges = "output_image_with_edges.jpg"
-    output_image_path_with_lines = "output_image_with_lines.jpg"
-    output_image_path_with_rectangle = "output_image_with_rectangle.jpg"
-
+    input_image_path = "assets/image.png"
     main(
         input_image_path,
-        output_image_path_with_corners,
-        output_image_path_with_edges,
-        output_image_path_with_lines,
-        output_image_path_with_rectangle,
     )
